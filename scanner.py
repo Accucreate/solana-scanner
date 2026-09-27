@@ -644,7 +644,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-This version uses RugCheck's documented token report for total holders, top holders, authorities and risk information, rather than trying to calculate holder counts from only Solana's 20-largest-account RPC response.
-
-Important: don't put your Telegram bot token inside this code. We'll add it securely through GitHub Actions Secrets in the next step.
