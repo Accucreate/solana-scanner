@@ -1,8 +1,6 @@
-import json
 import os
 import time
-import urllib.request
-import urllib.parse
+import requests
 from datetime import datetime, timezone
 
 # ============================================================
@@ -13,64 +11,115 @@ MIN_MC = 5_000
 MAX_MC = 100_000
 MIN_LIQUIDITY = 5_000
 
+SCAN_INTERVAL = 60
+
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 
-DEXSCREENER_PROFILES = (
+DEX_PROFILES_URL = (
     "https://api.dexscreener.com/token-profiles/latest/v1"
 )
 
-RUGCHECK_API = "https://api.rugcheck.xyz/v1/tokens"
+DEX_BOOSTS_URL = (
+    "https://api.dexscreener.com/token-boosts/latest/v1"
+)
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+DEX_TOKEN_URL = (
+    "https://api.dexscreener.com/tokens/v1/solana/"
+)
 
+RUGCHECK_URL = (
+    "https://api.rugcheck.xyz/v1/tokens/{}/report"
+)
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# Tokens already sent to Telegram
 seen = set()
 
+# Reusable HTTP session
+session = requests.Session()
+
+session.headers.update({
+    "User-Agent": "Solana-Token-Scanner/1.0",
+    "Accept": "application/json",
+})
+
 
 # ============================================================
-# HTTP HELPERS
+# BASIC HELPERS
 # ============================================================
 
-def get_json(url, timeout=20):
+def safe_float(value, default=0.0):
     try:
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 SolanaScanner/1.0",
-                "Accept": "application/json",
-            },
-        )
-
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
-
-    except Exception as e:
-        print(f"Request failed: {url}")
-        print(f"Error: {e}")
-        return None
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
 
 
-def post_json(url, payload, timeout=20):
+def safe_int(value, default=0):
     try:
-        body = json.dumps(payload).encode("utf-8")
+        if value is None:
+            return default
+        return int(float(value))
+    except Exception:
+        return default
 
-        request = urllib.request.Request(
-            url,
-            data=body,
-            headers={
-                "User-Agent": "Mozilla/5.0 SolanaScanner/1.0",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-            method="POST",
-        )
 
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
+def money(value):
+    value = safe_float(value)
 
-    except Exception as e:
-        print(f"POST failed: {e}")
-        return None
+    if value >= 1_000_000:
+        return f"${value / 1_000_000:.2f}M"
+
+    if value >= 1_000:
+        return f"${value:,.0f}"
+
+    return f"${value:.2f}"
+
+
+def shorten_address(address):
+    if not address:
+        return "Unknown"
+
+    if len(address) <= 12:
+        return address
+
+    return address[:6] + "..." + address[-6:]
+
+
+def format_age(created_at):
+    if not created_at:
+        return "Unknown"
+
+    try:
+        created_at = float(created_at)
+
+        # DexScreener gives milliseconds
+        if created_at > 10_000_000_000:
+            created_at /= 1000
+
+        now = time.time()
+        seconds = max(0, now - created_at)
+
+        minutes = int(seconds / 60)
+
+        if minutes < 60:
+            return f"{minutes} min"
+
+        hours = minutes // 60
+
+        if hours < 24:
+            return f"{hours} hr"
+
+        days = hours // 24
+
+        return f"{days} day"
+
+    except Exception:
+        return "Unknown"
 
 
 # ============================================================
@@ -78,173 +127,288 @@ def post_json(url, payload, timeout=20):
 # ============================================================
 
 def send_telegram(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram secrets are missing.")
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("ERROR: Telegram secrets are missing.")
+        print("Required:")
+        print("TELEGRAM_BOT_TOKEN")
+        print("TELEGRAM_CHAT_ID")
         return False
 
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{TELEGRAM_TOKEN}/sendMessage"
+    )
+
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "disable_web_page_preview": False,
+    }
+
     try:
-        url = (
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-            "/sendMessage"
+        response = session.post(
+            url,
+            json=payload,
+            timeout=20
         )
 
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "disable_web_page_preview": False,
-        }
-
-        result = post_json(url, payload)
-
-        if result and result.get("ok"):
+        if response.ok:
             print("Telegram alert sent.")
             return True
 
-        print("Telegram failed:", result)
-        return False
+        print(
+            "Telegram error:",
+            response.status_code,
+            response.text[:500]
+        )
 
     except Exception as e:
-        print("Telegram error:", e)
-        return False
+        print("Telegram connection error:", e)
+
+    return False
 
 
 # ============================================================
 # DEXSCREENER
 # ============================================================
 
-def get_latest_solana_tokens():
-    data = get_json(DEXSCREENER_PROFILES)
+def get_latest_profiles():
+    try:
+        response = session.get(
+            DEX_PROFILES_URL,
+            timeout=20
+        )
 
-    if not data:
+        if not response.ok:
+            print(
+                "DexScreener profiles error:",
+                response.status_code
+            )
+            return []
+
+        data = response.json()
+
+        if isinstance(data, list):
+            return data
+
         return []
 
-    if isinstance(data, list):
-        profiles = data
-    elif isinstance(data, dict):
-        profiles = data.get("tokens", data.get("profiles", []))
-    else:
-        profiles = []
-
-    results = []
-
-    for token in profiles:
-        try:
-            if token.get("chainId") == "solana":
-                address = (
-                    token.get("tokenAddress")
-                    or token.get("address")
-                    or token.get("token")
-                )
-
-                if address:
-                    results.append(address)
-
-        except Exception:
-            continue
-
-    return results
-
-
-def get_token_pairs(mint_address):
-    url = (
-        "https://api.dexscreener.com/latest/dex/tokens/"
-        + urllib.parse.quote(mint_address)
-    )
-
-    data = get_json(url)
-
-    if not data:
+    except Exception as e:
+        print("DexScreener profiles error:", e)
         return []
 
-    pairs = data.get("pairs", [])
 
-    if not isinstance(pairs, list):
+def get_latest_boosts():
+    try:
+        response = session.get(
+            DEX_BOOSTS_URL,
+            timeout=20
+        )
+
+        if not response.ok:
+            print(
+                "DexScreener boosts error:",
+                response.status_code
+            )
+            return []
+
+        data = response.json()
+
+        if isinstance(data, list):
+            return data
+
         return []
 
-    return [
-        p for p in pairs
-        if p.get("chainId") == "solana"
-    ]
+    except Exception as e:
+        print("DexScreener boosts error:", e)
+        return []
 
 
-def choose_best_pair(pairs):
-    if not pairs:
-        return None
+def get_token_pairs(mint):
+    try:
+        url = DEX_TOKEN_URL + mint
 
-    valid_pairs = []
+        response = session.get(
+            url,
+            timeout=20
+        )
+
+        if not response.ok:
+            print(
+                "DexScreener token error:",
+                response.status_code,
+                mint
+            )
+            return []
+
+        data = response.json()
+
+        if isinstance(data, list):
+            return data
+
+        return []
+
+    except Exception as e:
+        print(
+            "DexScreener token request error:",
+            mint,
+            e
+        )
+        return []
+
+
+def choose_best_pair(pairs, mint):
+    solana_pairs = []
 
     for pair in pairs:
-        try:
-            liquidity = pair.get("liquidity", {}).get("usd") or 0
-            valid_pairs.append((float(liquidity), pair))
-        except Exception:
+        if not isinstance(pair, dict):
             continue
 
-    if not valid_pairs:
+        if pair.get("chainId") != "solana":
+            continue
+
+        base = pair.get("baseToken") or {}
+
+        if base.get("address") != mint:
+            continue
+
+        liquidity = pair.get("liquidity") or {}
+
+        liquidity_usd = safe_float(
+            liquidity.get("usd")
+        )
+
+        solana_pairs.append(
+            (liquidity_usd, pair)
+        )
+
+    if not solana_pairs:
         return None
 
-    valid_pairs.sort(key=lambda x: x[0], reverse=True)
+    # Highest-liquidity pair
+    solana_pairs.sort(
+        key=lambda item: item[0],
+        reverse=True
+    )
 
-    return valid_pairs[0][1]
+    return solana_pairs[0][1]
 
 
 # ============================================================
 # RUGCHECK
 # ============================================================
 
-def get_rugcheck_report(mint_address):
-    url = (
-        f"{RUGCHECK_API}/"
-        f"{urllib.parse.quote(mint_address)}"
-        "/report"
+def get_rugcheck_report(mint):
+    url = RUGCHECK_URL.format(mint)
+
+    try:
+        response = session.get(
+            url,
+            timeout=25
+        )
+
+        if not response.ok:
+            print(
+                "RugCheck error:",
+                response.status_code,
+                mint
+            )
+            return {}
+
+        data = response.json()
+
+        if isinstance(data, dict):
+            return data
+
+        return {}
+
+    except Exception as e:
+        print(
+            "RugCheck request error:",
+            mint,
+            e
+        )
+        return {}
+
+
+# ============================================================
+# SECURITY DATA
+# ============================================================
+
+def get_security_data(mint):
+    report = get_rugcheck_report(mint)
+
+    if not report:
+        return {
+            "mint_authority": "Unknown",
+            "freeze_authority": "Unknown",
+            "holders": "Unknown",
+            "top10": "Unknown",
+            "risk": "Unavailable",
+        }
+
+    token_data = report.get("token") or {}
+
+    # -------------------------
+    # Mint authority
+    # -------------------------
+
+    mint_authority = token_data.get(
+        "mintAuthority"
     )
 
-    return get_json(url, timeout=25)
+    if mint_authority:
+        mint_status = "Active"
+    else:
+        mint_status = "Revoked"
 
+    # -------------------------
+    # Freeze authority
+    # -------------------------
 
-def parse_rugcheck(report):
-    data = {
-        "holders": "N/A",
-        "mint": "Unknown",
-        "freeze": "Unknown",
-        "top10": "N/A",
-        "risk_score": "N/A",
-        "risk_level": "N/A",
-    }
+    freeze_authority = token_data.get(
+        "freezeAuthority"
+    )
 
-    if not isinstance(report, dict):
-        return data
+    if freeze_authority:
+        freeze_status = "Active"
+    else:
+        freeze_status = "Revoked"
 
+    # -------------------------
     # Holder count
-    holders = report.get("totalHolders")
+    # -------------------------
+
+    holders = (
+        report.get("totalHolders")
+        or report.get("holderCount")
+        or report.get("holdersCount")
+        or report.get("holders")
+    )
+
+    if isinstance(holders, list):
+        holders = len(holders)
 
     if holders is not None:
-        try:
-            data["holders"] = int(holders)
-        except Exception:
-            data["holders"] = str(holders)
-
-    # Authorities
-    token = report.get("token", {})
-
-    if isinstance(token, dict):
-        mint_authority = token.get("mintAuthority")
-        freeze_authority = token.get("freezeAuthority")
-
-        data["mint"] = (
-            "Revoked"
-            if not mint_authority
-            else "Active"
+        holders = safe_int(
+            holders,
+            default=0
         )
 
-        data["freeze"] = (
-            "Revoked"
-            if not freeze_authority
-            else "Active"
-        )
+    if not holders:
+        holders_display = "Unknown"
+    else:
+        holders_display = f"{holders:,}"
 
-    # Top-10 concentration
-    top_holders = report.get("topHolders", [])
+    # -------------------------
+    # Top 10 concentration
+    # -------------------------
+
+    top_holders = report.get(
+        "topHolders"
+    )
+
+    top10 = None
 
     if isinstance(top_holders, list):
         percentages = []
@@ -255,392 +419,429 @@ def parse_rugcheck(report):
 
             pct = holder.get("pct")
 
-            if pct is None:
-                pct = holder.get("percentage")
-
-            try:
-                percentages.append(float(pct))
-            except Exception:
-                pass
+            if pct is not None:
+                percentages.append(
+                    safe_float(pct)
+                )
 
         if percentages:
-            data["top10"] = sum(percentages)
+            top10 = sum(percentages)
 
-    # RugCheck risk score
-    score = report.get("score_normalised")
+    if top10 is None:
+        top10_display = "Unknown"
+    else:
+        top10_display = f"{top10:.1f}%"
 
-    if score is None:
-        score = report.get("score")
+    # -------------------------
+    # Risk information
+    # -------------------------
 
-    if score is not None:
-        data["risk_score"] = score
+    risks = report.get("risks")
 
-    # Try to determine risk level from risks
-    risks = report.get("risks", [])
+    risk_names = []
 
     if isinstance(risks, list):
-        levels = []
-
-        for risk in risks:
-            if isinstance(risk, dict):
-                level = risk.get("level")
-
-                if level:
-                    levels.append(str(level).lower())
-
-        if "danger" in levels:
-            data["risk_level"] = "Danger"
-        elif "warn" in levels:
-            data["risk_level"] = "Warning"
-        elif levels:
-            data["risk_level"] = levels[0].title()
-
-    return data
-
-
-# ============================================================
-# TOKEN SECURITY BACKUP
-# ============================================================
-
-def get_token_security(mint_address):
-    """
-    Backup authority check directly from Solana RPC.
-
-    RugCheck is preferred because it also supplies holder
-    and concentration information.
-    """
-
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getAccountInfo",
-        "params": [
-            mint_address,
-            {
-                "encoding": "jsonParsed",
-                "commitment": "confirmed",
-            },
-        ],
-    }
-
-    result = post_json(SOLANA_RPC, payload)
-
-    if not result:
-        return "Unknown", "Unknown"
-
-    try:
-        value = result["result"]["value"]
-
-        if not value:
-            return "Unknown", "Unknown"
-
-        parsed = value["data"]["parsed"]["info"]
-
-        mint_authority = parsed.get("mintAuthority")
-        freeze_authority = parsed.get("freezeAuthority")
-
-        mint_status = (
-            "Revoked"
-            if not mint_authority
-            else "Active"
-        )
-
-        freeze_status = (
-            "Revoked"
-            if not freeze_authority
-            else "Active"
-        )
-
-        return mint_status, freeze_status
-
-    except Exception as e:
-        print("Security parsing error:", e)
-        return "Unknown", "Unknown"
-
-
-# ============================================================
-# AGE
-# ============================================================
-
-def format_age(pair):
-    created = pair.get("pairCreatedAt")
-
-    if not created:
-        return "N/A"
-
-    try:
-        created_seconds = float(created) / 1000
-        now = time.time()
-
-        age_seconds = max(0, now - created_seconds)
-
-        minutes = int(age_seconds / 60)
-
-        if minutes < 60:
-            return f"{minutes} min"
-
-        hours = minutes // 60
-        remaining_minutes = minutes % 60
-
-        if hours < 24:
-            return f"{hours}h {remaining_minutes}m"
-
-        days = hours // 24
-
-        return f"{days}d"
-
-    except Exception:
-        return "N/A"
-
-
-# ============================================================
-# FORMATTING
-# ============================================================
-
-def money(value):
-    try:
-        value = float(value)
-
-        if value >= 1_000_000:
-            return f"${value / 1_000_000:.2f}M"
-
-        if value >= 1_000:
-            return f"${value:,.0f}"
-
-        return f"${value:.2f}"
-
-    except Exception:
-        return "N/A"
-
-
-def format_holders(value):
-    if value == "N/A":
-        return "N/A"
-
-    try:
-        return f"{int(value):,}"
-    except Exception:
-        return str(value)
-
-
-def format_percent(value):
-    if value == "N/A":
-        return "N/A"
-
-    try:
-        return f"{float(value):.1f}%"
-    except Exception:
-        return str(value)
-
-
-# ============================================================
-# TOKEN ANALYSIS
-# ============================================================
-
-def analyse_token(mint_address):
-    print(f"Checking: {mint_address}")
-
-    pairs = get_token_pairs(mint_address)
-
-    if not pairs:
-        return None
-
-    pair = choose_best_pair(pairs)
-
-    if not pair:
-        return None
-
-    try:
-        liquidity = float(
-            pair.get("liquidity", {}).get("usd") or 0
-        )
-
-        market_cap = float(
-            pair.get("marketCap")
-            or pair.get("fdv")
-            or 0
-        )
-
-        volume = float(
-            pair.get("volume", {}).get("h24") or 0
-        )
-
-    except Exception:
-        return None
-
-    # Apply the scanner filters
-    if market_cap < MIN_MC:
-        return None
-
-    if market_cap > MAX_MC:
-        return None
-
-    if liquidity < MIN_LIQUIDITY:
-        return None
-
-    base_token = pair.get("baseToken", {})
-
-    name = (
-        base_token.get("name")
-        or "Unknown"
-    )
-
-    symbol = (
-        base_token.get("symbol")
-        or "UNKNOWN"
-    )
-
-    # RugCheck
-    report = get_rugcheck_report(mint_address)
-
-    security = parse_rugcheck(report)
-
-    # Backup security check if RugCheck didn't provide it
-    if security["mint"] == "Unknown" or security["freeze"] == "Unknown":
-        mint_status, freeze_status = get_token_security(
-            mint_address
-        )
-
-        if security["mint"] == "Unknown":
-            security["mint"] = mint_status
-
-        if security["freeze"] == "Unknown":
-            security["freeze"] = freeze_status
-
-    age = format_age(pair)
-
-    dex_url = (
-        f"https://dexscreener.com/solana/"
-        f"{mint_address}"
-    )
-
-    rug_url = (
-        f"https://rugcheck.xyz/tokens/"
-        f"{mint_address}"
-    )
+        for risk in risks[:3]:
+            if not isinstance(risk, dict):
+                continue
+
+            name = risk.get("name")
+
+            if name:
+                risk_names.append(str(name))
+
+    if risk_names:
+        risk_display = ", ".join(risk_names)
+    else:
+        risk_display = "No reported risks"
 
     return {
-        "name": name,
-        "symbol": symbol,
-        "mint": mint_address,
-        "market_cap": market_cap,
-        "liquidity": liquidity,
-        "volume": volume,
-        "holders": security["holders"],
-        "age": age,
-        "mint_authority": security["mint"],
-        "freeze_authority": security["freeze"],
-        "top10": security["top10"],
-        "risk_score": security["risk_score"],
-        "risk_level": security["risk_level"],
-        "dex_url": dex_url,
-        "rug_url": rug_url,
+        "mint_authority": mint_status,
+        "freeze_authority": freeze_status,
+        "holders": holders_display,
+        "top10": top10_display,
+        "risk": risk_display,
     }
 
 
 # ============================================================
-# TELEGRAM MESSAGE
+# BUILD ALERT
 # ============================================================
 
-def build_alert(token):
-    return (
-        "🚨 NEW SOLANA TOKEN\n\n"
+def build_alert(pair, security):
+    base = pair.get("baseToken") or {}
 
-        f"Name: {token['name']} "
-        f"({token['symbol']})\n"
-        f"CA: {token['mint']}\n\n"
+    mint = base.get("address", "Unknown")
 
-        f"💰 MC: {money(token['market_cap'])}\n"
-        f"💧 Liquidity: {money(token['liquidity'])}\n"
-        f"👥 Holders: {format_holders(token['holders'])}\n"
-        f"⏱ Age: {token['age']}\n"
-        f"📊 Volume: {money(token['volume'])}\n\n"
+    name = base.get("name") or "Unknown"
 
-        f"🔒 Mint: {token['mint_authority']}\n"
-        f"❄️ Freeze: {token['freeze_authority']}\n"
-        f"🐋 Top 10: {format_percent(token['top10'])}\n"
+    symbol = base.get("symbol") or ""
 
-        f"🛡 RugCheck: {token['risk_level']} "
-        f"({token['risk_score']})\n\n"
+    if symbol:
+        token_name = f"{name} (${symbol})"
+    else:
+        token_name = name
 
-        f"🔗 DexScreener: {token['dex_url']}\n"
-        f"🔗 RugCheck: {token['rug_url']}\n\n"
-
-        "⚠️ DYOR. This alert is data only, "
-        "not financial advice."
+    market_cap = safe_float(
+        pair.get("marketCap")
     )
+
+    if market_cap <= 0:
+        market_cap = safe_float(
+            pair.get("fdv")
+        )
+
+    liquidity_data = pair.get(
+        "liquidity"
+    ) or {}
+
+    liquidity = safe_float(
+        liquidity_data.get("usd")
+    )
+
+    volume_data = pair.get(
+        "volume"
+    ) or {}
+
+    volume_24h = safe_float(
+        volume_data.get("h24")
+    )
+
+    age = format_age(
+        pair.get("pairCreatedAt")
+    )
+
+    dex_url = pair.get("url")
+
+    if not dex_url:
+        dex_url = (
+            "https://dexscreener.com/solana/"
+            + mint
+        )
+
+    rug_url = (
+        "https://rugcheck.xyz/tokens/"
+        + mint
+    )
+
+    alert = f"""🚨 NEW SOLANA TOKEN
+
+Name: {token_name}
+CA: {mint}
+
+💰 MC: {money(market_cap)}
+💧 Liquidity: {money(liquidity)}
+👥 Holders: {security["holders"]}
+⏱ Age: {age}
+📊 Volume 24h: {money(volume_24h)}
+
+🔒 Mint: {security["mint_authority"]}
+❄️ Freeze: {security["freeze_authority"]}
+🐋 Top 10: {security["top10"]}
+
+⚠️ RugCheck:
+{security["risk"]}
+
+🔗 DexScreener:
+{dex_url}
+
+🔗 RugCheck:
+{rug_url}
+
+⚠️ DYOR — This alert is only a screening tool.
+Do not buy a token solely because it passed these filters.
+"""
+
+    return alert
+
+
+# ============================================================
+# PROCESS TOKEN
+# ============================================================
+
+def process_token(mint):
+    if not mint:
+        return
+
+    if mint in seen:
+        return
+
+    print()
+    print("=" * 60)
+    print("Checking:", mint)
+
+    pairs = get_token_pairs(mint)
+
+    if not pairs:
+        print("No DexScreener pair.")
+        return
+
+    pair = choose_best_pair(
+        pairs,
+        mint
+    )
+
+    if not pair:
+        print("No Solana pair found.")
+        return
+
+    market_cap = safe_float(
+        pair.get("marketCap")
+    )
+
+    if market_cap <= 0:
+        market_cap = safe_float(
+            pair.get("fdv")
+        )
+
+    liquidity_data = pair.get(
+        "liquidity"
+    ) or {}
+
+    liquidity = safe_float(
+        liquidity_data.get("usd")
+    )
+
+    print(
+        "MC:",
+        money(market_cap),
+        "| Liquidity:",
+        money(liquidity)
+    )
+
+    # -------------------------
+    # Market cap filter
+    # -------------------------
+
+    if market_cap < MIN_MC:
+        print("Rejected: MC too low.")
+        return
+
+    if market_cap > MAX_MC:
+        print("Rejected: MC too high.")
+        return
+
+    # -------------------------
+    # Liquidity filter
+    # -------------------------
+
+    if liquidity < MIN_LIQUIDITY:
+        print("Rejected: liquidity too low.")
+        return
+
+    print("PASSED MC + LIQUIDITY FILTER")
+
+    # -------------------------
+    # Security
+    # -------------------------
+
+    security = get_security_data(
+        mint
+    )
+
+    # -------------------------
+    # Alert
+    # -------------------------
+
+    message = build_alert(
+        pair,
+        security
+    )
+
+    success = send_telegram(
+        message
+    )
+
+    if success:
+        seen.add(mint)
+        print(
+            "Token added to seen list:",
+            mint
+        )
+
+
+# ============================================================
+# DISCOVER TOKENS
+# ============================================================
+
+def discover_tokens():
+    addresses = set()
+
+    # Latest token profiles
+    profiles = get_latest_profiles()
+
+    for item in profiles:
+        if not isinstance(item, dict):
+            continue
+
+        if item.get("chainId") != "solana":
+            continue
+
+        mint = item.get("tokenAddress")
+
+        if mint:
+            addresses.add(mint)
+
+    # Latest boosts
+    boosts = get_latest_boosts()
+
+    for item in boosts:
+        if not isinstance(item, dict):
+            continue
+
+        if item.get("chainId") != "solana":
+            continue
+
+        mint = item.get("tokenAddress")
+
+        if mint:
+            addresses.add(mint)
+
+    return list(addresses)
+
+
+# ============================================================
+# TEST CONFIGURATION
+# ============================================================
+
+def check_configuration():
+    print("=" * 60)
+    print("SOLANA TELEGRAM SCANNER")
+    print("=" * 60)
+
+    print(
+        "Minimum MC:",
+        money(MIN_MC)
+    )
+
+    print(
+        "Maximum MC:",
+        money(MAX_MC)
+    )
+
+    print(
+        "Minimum liquidity:",
+        money(MIN_LIQUIDITY)
+    )
+
+    print(
+        "Scan interval:",
+        SCAN_INTERVAL,
+        "seconds"
+    )
+
+    if not TELEGRAM_TOKEN:
+        print(
+            "❌ TELEGRAM_BOT_TOKEN is missing."
+        )
+        return False
+
+    if not TELEGRAM_CHAT_ID:
+        print(
+            "❌ TELEGRAM_CHAT_ID is missing."
+        )
+        return False
+
+    print("✅ Telegram token found.")
+    print("✅ Telegram chat ID found.")
+
+    return True
 
 
 # ============================================================
 # MAIN SCANNER
 # ============================================================
 
-def main():
-    print("=" * 60)
-    print("SOLANA SCANNER STARTED")
-    print(
-        f"Filters: MC ${MIN_MC:,}-${MAX_MC:,} | "
-        f"Liquidity ${MIN_LIQUIDITY:,}+"
-    )
+def scan():
+    print()
     print(
         datetime.now(timezone.utc).strftime(
-            "UTC time: %Y-%m-%d %H:%M:%S"
+            "%Y-%m-%d %H:%M:%S UTC"
         )
     )
-    print("=" * 60)
 
-    if not TELEGRAM_BOT_TOKEN:
-        print("WARNING: TELEGRAM_BOT_TOKEN is missing.")
+    tokens = discover_tokens()
 
-    if not TELEGRAM_CHAT_ID:
-        print("WARNING: TELEGRAM_CHAT_ID is missing.")
+    print(
+        "Discovered",
+        len(tokens),
+        "Solana token addresses."
+    )
 
-    addresses = get_latest_solana_tokens()
-
-    print(f"Found {len(addresses)} latest Solana token profiles.")
-
-    if not addresses:
-        print("No token profiles returned.")
+    if not tokens:
+        print(
+            "No tokens discovered this cycle."
+        )
         return
 
-    # Avoid scanning too many tokens in one GitHub Actions run
-    addresses = addresses[:50]
+    checked = 0
 
-    for mint_address in addresses:
-
-        if mint_address in seen:
-            continue
-
+    for mint in tokens:
         try:
-            token = analyse_token(mint_address)
-
-            if not token:
-                continue
-
-            print(
-                f"MATCH: {token['name']} | "
-                f"MC {money(token['market_cap'])} | "
-                f"Liquidity {money(token['liquidity'])}"
-            )
-
-            message = build_alert(token)
-
-            if send_telegram(message):
-                seen.add(mint_address)
-
-            # Small delay to reduce API pressure
-            time.sleep(1)
+            process_token(mint)
+            checked += 1
 
         except Exception as e:
             print(
-                f"ERROR scanning {mint_address}: {e}"
+                "Token processing error:",
+                mint,
+                e
             )
-            continue
 
-    print("=" * 60)
-    print("SCAN FINISHED")
-    print("=" * 60)
+    print(
+        "Finished cycle.",
+        "Checked:",
+        checked,
+        "| Alerts:",
+        len(seen)
+    )
 
+
+def main():
+    if not check_configuration():
+        print()
+        print(
+            "Scanner stopped because configuration "
+            "is incomplete."
+        )
+        return
+
+    print()
+    print("🚀 Scanner started.")
+    print()
+
+    while True:
+        try:
+            scan()
+
+        except KeyboardInterrupt:
+            print(
+                "Scanner stopped."
+            )
+            break
+
+        except Exception as e:
+            print(
+                "MAIN SCANNER ERROR:",
+                e
+            )
+
+        print()
+        print(
+            "Waiting",
+            SCAN_INTERVAL,
+            "seconds..."
+        )
+        print()
+
+        time.sleep(
+            SCAN_INTERVAL
+        )
+
+
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
     main()
