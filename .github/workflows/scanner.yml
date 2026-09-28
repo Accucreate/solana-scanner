@@ -1,6 +1,10 @@
 name: Solana Token Scanner
 
 on:
+  push:
+    branches:
+      - main
+
   schedule:
     - cron: "3,8,13,18,23,28,33,38,43,48,53,58 * * * *"
 
