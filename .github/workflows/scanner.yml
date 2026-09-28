@@ -2,7 +2,10 @@ name: Solana Token Scanner
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    # Run every 5 minutes, starting at minute 3
+    # (avoids the busy :00 start of the hour)
+    - cron: "3-58/5 * * * *"
+
   workflow_dispatch:
 
 jobs:
