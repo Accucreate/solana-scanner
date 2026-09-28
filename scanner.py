@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import requests
 from datetime import datetime, timezone
@@ -11,7 +12,7 @@ MIN_MC = 5_000
 MAX_MC = 100_000
 MIN_LIQUIDITY = 5_000
 
-SCAN_INTERVAL = 60
+SEEN_FILE = "seen_tokens.json"
 
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 
@@ -34,9 +35,6 @@ RUGCHECK_URL = (
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Tokens already sent to Telegram
-seen = set()
-
 # Reusable HTTP session
 session = requests.Session()
 
@@ -47,6 +45,56 @@ session.headers.update({
 
 
 # ============================================================
+# SEEN TOKEN STORAGE
+# ============================================================
+
+def load_seen():
+    """
+    Load tokens that have already triggered an alert.
+    This file is preserved between GitHub Actions runs
+    using the GitHub Actions cache.
+    """
+
+    if not os.path.exists(SEEN_FILE):
+        return set()
+
+    try:
+        with open(SEEN_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+
+        if isinstance(data, list):
+            return set(data)
+
+    except Exception as e:
+        print("Could not load seen tokens:", e)
+
+    return set()
+
+
+def save_seen(seen):
+    """
+    Save alerted token addresses.
+    """
+
+    try:
+        with open(SEEN_FILE, "w", encoding="utf-8") as file:
+            json.dump(
+                sorted(list(seen)),
+                file,
+                indent=2
+            )
+
+        print(
+            "Saved",
+            len(seen),
+            "seen tokens."
+        )
+
+    except Exception as e:
+        print("Could not save seen tokens:", e)
+
+
+# ============================================================
 # BASIC HELPERS
 # ============================================================
 
@@ -54,7 +102,9 @@ def safe_float(value, default=0.0):
     try:
         if value is None:
             return default
+
         return float(value)
+
     except Exception:
         return default
 
@@ -63,7 +113,9 @@ def safe_int(value, default=0):
     try:
         if value is None:
             return default
+
         return int(float(value))
+
     except Exception:
         return default
 
@@ -80,16 +132,6 @@ def money(value):
     return f"${value:.2f}"
 
 
-def shorten_address(address):
-    if not address:
-        return "Unknown"
-
-    if len(address) <= 12:
-        return address
-
-    return address[:6] + "..." + address[-6:]
-
-
 def format_age(created_at):
     if not created_at:
         return "Unknown"
@@ -97,14 +139,20 @@ def format_age(created_at):
     try:
         created_at = float(created_at)
 
-        # DexScreener gives milliseconds
+        # DexScreener normally gives milliseconds
         if created_at > 10_000_000_000:
             created_at /= 1000
 
         now = time.time()
-        seconds = max(0, now - created_at)
 
-        minutes = int(seconds / 60)
+        seconds = max(
+            0,
+            now - created_at
+        )
+
+        minutes = int(
+            seconds / 60
+        )
 
         if minutes < 60:
             return f"{minutes} min"
@@ -127,11 +175,17 @@ def format_age(created_at):
 # ============================================================
 
 def send_telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("ERROR: Telegram secrets are missing.")
-        print("Required:")
-        print("TELEGRAM_BOT_TOKEN")
-        print("TELEGRAM_CHAT_ID")
+
+    if not TELEGRAM_TOKEN:
+        print(
+            "ERROR: TELEGRAM_BOT_TOKEN is missing."
+        )
+        return False
+
+    if not TELEGRAM_CHAT_ID:
+        print(
+            "ERROR: TELEGRAM_CHAT_ID is missing."
+        )
         return False
 
     url = (
@@ -146,6 +200,7 @@ def send_telegram(message):
     }
 
     try:
+
         response = session.post(
             url,
             json=payload,
@@ -153,7 +208,9 @@ def send_telegram(message):
         )
 
         if response.ok:
-            print("Telegram alert sent.")
+            print(
+                "Telegram alert sent."
+            )
             return True
 
         print(
@@ -163,7 +220,11 @@ def send_telegram(message):
         )
 
     except Exception as e:
-        print("Telegram connection error:", e)
+
+        print(
+            "Telegram connection error:",
+            e
+        )
 
     return False
 
@@ -173,17 +234,21 @@ def send_telegram(message):
 # ============================================================
 
 def get_latest_profiles():
+
     try:
+
         response = session.get(
             DEX_PROFILES_URL,
             timeout=20
         )
 
         if not response.ok:
+
             print(
                 "DexScreener profiles error:",
                 response.status_code
             )
+
             return []
 
         data = response.json()
@@ -191,25 +256,32 @@ def get_latest_profiles():
         if isinstance(data, list):
             return data
 
-        return []
-
     except Exception as e:
-        print("DexScreener profiles error:", e)
-        return []
+
+        print(
+            "DexScreener profiles error:",
+            e
+        )
+
+    return []
 
 
 def get_latest_boosts():
+
     try:
+
         response = session.get(
             DEX_BOOSTS_URL,
             timeout=20
         )
 
         if not response.ok:
+
             print(
                 "DexScreener boosts error:",
                 response.status_code
             )
+
             return []
 
         data = response.json()
@@ -217,15 +289,20 @@ def get_latest_boosts():
         if isinstance(data, list):
             return data
 
-        return []
-
     except Exception as e:
-        print("DexScreener boosts error:", e)
-        return []
+
+        print(
+            "DexScreener boosts error:",
+            e
+        )
+
+    return []
 
 
 def get_token_pairs(mint):
+
     try:
+
         url = DEX_TOKEN_URL + mint
 
         response = session.get(
@@ -234,11 +311,13 @@ def get_token_pairs(mint):
         )
 
         if not response.ok:
+
             print(
                 "DexScreener token error:",
                 response.status_code,
                 mint
             )
+
             return []
 
         data = response.json()
@@ -246,46 +325,54 @@ def get_token_pairs(mint):
         if isinstance(data, list):
             return data
 
-        return []
-
     except Exception as e:
+
         print(
             "DexScreener token request error:",
             mint,
             e
         )
-        return []
+
+    return []
 
 
 def choose_best_pair(pairs, mint):
+
     solana_pairs = []
 
     for pair in pairs:
+
         if not isinstance(pair, dict):
             continue
 
         if pair.get("chainId") != "solana":
             continue
 
-        base = pair.get("baseToken") or {}
+        base = pair.get(
+            "baseToken"
+        ) or {}
 
         if base.get("address") != mint:
             continue
 
-        liquidity = pair.get("liquidity") or {}
+        liquidity = pair.get(
+            "liquidity"
+        ) or {}
 
         liquidity_usd = safe_float(
             liquidity.get("usd")
         )
 
         solana_pairs.append(
-            (liquidity_usd, pair)
+            (
+                liquidity_usd,
+                pair
+            )
         )
 
     if not solana_pairs:
         return None
 
-    # Highest-liquidity pair
     solana_pairs.sort(
         key=lambda item: item[0],
         reverse=True
@@ -299,20 +386,24 @@ def choose_best_pair(pairs, mint):
 # ============================================================
 
 def get_rugcheck_report(mint):
+
     url = RUGCHECK_URL.format(mint)
 
     try:
+
         response = session.get(
             url,
             timeout=25
         )
 
         if not response.ok:
+
             print(
                 "RugCheck error:",
                 response.status_code,
                 mint
             )
+
             return {}
 
         data = response.json()
@@ -320,15 +411,15 @@ def get_rugcheck_report(mint):
         if isinstance(data, dict):
             return data
 
-        return {}
-
     except Exception as e:
+
         print(
             "RugCheck request error:",
             mint,
             e
         )
-        return {}
+
+    return {}
 
 
 # ============================================================
@@ -336,9 +427,13 @@ def get_rugcheck_report(mint):
 # ============================================================
 
 def get_security_data(mint):
-    report = get_rugcheck_report(mint)
+
+    report = get_rugcheck_report(
+        mint
+    )
 
     if not report:
+
         return {
             "mint_authority": "Unknown",
             "freeze_authority": "Unknown",
@@ -347,7 +442,9 @@ def get_security_data(mint):
             "risk": "Unavailable",
         }
 
-    token_data = report.get("token") or {}
+    token_data = report.get(
+        "token"
+    ) or {}
 
     # -------------------------
     # Mint authority
@@ -390,15 +487,21 @@ def get_security_data(mint):
         holders = len(holders)
 
     if holders is not None:
+
         holders = safe_int(
             holders,
             default=0
         )
 
     if not holders:
+
         holders_display = "Unknown"
+
     else:
-        holders_display = f"{holders:,}"
+
+        holders_display = (
+            f"{holders:,}"
+        )
 
     # -------------------------
     # Top 10 concentration
@@ -411,49 +514,87 @@ def get_security_data(mint):
     top10 = None
 
     if isinstance(top_holders, list):
+
         percentages = []
 
         for holder in top_holders[:10]:
-            if not isinstance(holder, dict):
+
+            if not isinstance(
+                holder,
+                dict
+            ):
                 continue
 
-            pct = holder.get("pct")
+            pct = holder.get(
+                "pct"
+            )
 
             if pct is not None:
+
                 percentages.append(
                     safe_float(pct)
                 )
 
         if percentages:
-            top10 = sum(percentages)
+
+            top10 = sum(
+                percentages
+            )
 
     if top10 is None:
+
         top10_display = "Unknown"
+
     else:
-        top10_display = f"{top10:.1f}%"
+
+        top10_display = (
+            f"{top10:.1f}%"
+        )
 
     # -------------------------
     # Risk information
     # -------------------------
 
-    risks = report.get("risks")
+    risks = report.get(
+        "risks"
+    )
 
     risk_names = []
 
-    if isinstance(risks, list):
+    if isinstance(
+        risks,
+        list
+    ):
+
         for risk in risks[:3]:
-            if not isinstance(risk, dict):
+
+            if not isinstance(
+                risk,
+                dict
+            ):
                 continue
 
-            name = risk.get("name")
+            name = risk.get(
+                "name"
+            )
 
             if name:
-                risk_names.append(str(name))
+
+                risk_names.append(
+                    str(name)
+                )
 
     if risk_names:
-        risk_display = ", ".join(risk_names)
+
+        risk_display = ", ".join(
+            risk_names
+        )
+
     else:
-        risk_display = "No reported risks"
+
+        risk_display = (
+            "No reported risks"
+        )
 
     return {
         "mint_authority": mint_status,
@@ -465,21 +606,36 @@ def get_security_data(mint):
 
 
 # ============================================================
-# BUILD ALERT
+# BUILD TELEGRAM ALERT
 # ============================================================
 
 def build_alert(pair, security):
-    base = pair.get("baseToken") or {}
 
-    mint = base.get("address", "Unknown")
+    base = pair.get(
+        "baseToken"
+    ) or {}
 
-    name = base.get("name") or "Unknown"
+    mint = base.get(
+        "address",
+        "Unknown"
+    )
 
-    symbol = base.get("symbol") or ""
+    name = base.get(
+        "name"
+    ) or "Unknown"
+
+    symbol = base.get(
+        "symbol"
+    ) or ""
 
     if symbol:
-        token_name = f"{name} (${symbol})"
+
+        token_name = (
+            f"{name} (${symbol})"
+        )
+
     else:
+
         token_name = name
 
     market_cap = safe_float(
@@ -487,6 +643,7 @@ def build_alert(pair, security):
     )
 
     if market_cap <= 0:
+
         market_cap = safe_float(
             pair.get("fdv")
         )
@@ -511,9 +668,12 @@ def build_alert(pair, security):
         pair.get("pairCreatedAt")
     )
 
-    dex_url = pair.get("url")
+    dex_url = pair.get(
+        "url"
+    )
 
     if not dex_url:
+
         dex_url = (
             "https://dexscreener.com/solana/"
             + mint
@@ -524,7 +684,7 @@ def build_alert(pair, security):
         + mint
     )
 
-    alert = f"""🚨 NEW SOLANA TOKEN
+    return f"""🚨 NEW SOLANA TOKEN
 
 Name: {token_name}
 CA: {mint}
@@ -552,29 +712,43 @@ CA: {mint}
 Do not buy a token solely because it passed these filters.
 """
 
-    return alert
-
 
 # ============================================================
 # PROCESS TOKEN
 # ============================================================
 
-def process_token(mint):
+def process_token(mint, seen):
+
     if not mint:
-        return
+        return False
 
     if mint in seen:
-        return
+
+        print(
+            "Already alerted:",
+            mint
+        )
+
+        return False
 
     print()
     print("=" * 60)
-    print("Checking:", mint)
+    print(
+        "Checking:",
+        mint
+    )
 
-    pairs = get_token_pairs(mint)
+    pairs = get_token_pairs(
+        mint
+    )
 
     if not pairs:
-        print("No DexScreener pair.")
-        return
+
+        print(
+            "No DexScreener pair."
+        )
+
+        return False
 
     pair = choose_best_pair(
         pairs,
@@ -582,14 +756,19 @@ def process_token(mint):
     )
 
     if not pair:
-        print("No Solana pair found.")
-        return
+
+        print(
+            "No Solana pair found."
+        )
+
+        return False
 
     market_cap = safe_float(
         pair.get("marketCap")
     )
 
     if market_cap <= 0:
+
         market_cap = safe_float(
             pair.get("fdv")
         )
@@ -610,29 +789,43 @@ def process_token(mint):
     )
 
     # -------------------------
-    # Market cap filter
+    # MC FILTER
     # -------------------------
 
     if market_cap < MIN_MC:
-        print("Rejected: MC too low.")
-        return
+
+        print(
+            "Rejected: MC too low."
+        )
+
+        return False
 
     if market_cap > MAX_MC:
-        print("Rejected: MC too high.")
-        return
+
+        print(
+            "Rejected: MC too high."
+        )
+
+        return False
 
     # -------------------------
-    # Liquidity filter
+    # LIQUIDITY FILTER
     # -------------------------
 
     if liquidity < MIN_LIQUIDITY:
-        print("Rejected: liquidity too low.")
-        return
 
-    print("PASSED MC + LIQUIDITY FILTER")
+        print(
+            "Rejected: liquidity too low."
+        )
+
+        return False
+
+    print(
+        "PASSED MC + LIQUIDITY FILTER"
+    )
 
     # -------------------------
-    # Security
+    # SECURITY
     # -------------------------
 
     security = get_security_data(
@@ -640,7 +833,7 @@ def process_token(mint):
     )
 
     # -------------------------
-    # Alert
+    # TELEGRAM
     # -------------------------
 
     message = build_alert(
@@ -653,11 +846,19 @@ def process_token(mint):
     )
 
     if success:
-        seen.add(mint)
+
+        seen.add(
+            mint
+        )
+
         print(
             "Token added to seen list:",
             mint
         )
+
+        return True
+
+    return False
 
 
 # ============================================================
@@ -665,48 +866,82 @@ def process_token(mint):
 # ============================================================
 
 def discover_tokens():
+
     addresses = set()
 
-    # Latest token profiles
+    # -------------------------
+    # Latest profiles
+    # -------------------------
+
     profiles = get_latest_profiles()
 
     for item in profiles:
-        if not isinstance(item, dict):
+
+        if not isinstance(
+            item,
+            dict
+        ):
             continue
 
-        if item.get("chainId") != "solana":
+        if item.get(
+            "chainId"
+        ) != "solana":
+
             continue
 
-        mint = item.get("tokenAddress")
+        mint = item.get(
+            "tokenAddress"
+        )
 
         if mint:
-            addresses.add(mint)
+            addresses.add(
+                mint
+            )
 
+    # -------------------------
     # Latest boosts
+    # -------------------------
+
     boosts = get_latest_boosts()
 
     for item in boosts:
-        if not isinstance(item, dict):
+
+        if not isinstance(
+            item,
+            dict
+        ):
             continue
 
-        if item.get("chainId") != "solana":
+        if item.get(
+            "chainId"
+        ) != "solana":
+
             continue
 
-        mint = item.get("tokenAddress")
+        mint = item.get(
+            "tokenAddress"
+        )
 
         if mint:
-            addresses.add(mint)
+            addresses.add(
+                mint
+            )
 
-    return list(addresses)
+    return list(
+        addresses
+    )
 
 
 # ============================================================
-# TEST CONFIGURATION
+# CONFIGURATION
 # ============================================================
 
 def check_configuration():
+
     print("=" * 60)
-    print("SOLANA TELEGRAM SCANNER")
+    print(
+        "SOLANA TELEGRAM SCANNER"
+    )
     print("=" * 60)
 
     print(
@@ -724,40 +959,54 @@ def check_configuration():
         money(MIN_LIQUIDITY)
     )
 
-    print(
-        "Scan interval:",
-        SCAN_INTERVAL,
-        "seconds"
-    )
-
     if not TELEGRAM_TOKEN:
+
         print(
             "❌ TELEGRAM_BOT_TOKEN is missing."
         )
+
         return False
 
     if not TELEGRAM_CHAT_ID:
+
         print(
             "❌ TELEGRAM_CHAT_ID is missing."
         )
+
         return False
 
-    print("✅ Telegram token found.")
-    print("✅ Telegram chat ID found.")
+    print(
+        "✅ Telegram token found."
+    )
+
+    print(
+        "✅ Telegram chat ID found."
+    )
 
     return True
 
 
 # ============================================================
-# MAIN SCANNER
+# ONE SCAN
 # ============================================================
 
 def scan():
+
     print()
+
     print(
-        datetime.now(timezone.utc).strftime(
+        datetime.now(
+            timezone.utc
+        ).strftime(
             "%Y-%m-%d %H:%M:%S UTC"
         )
+    )
+
+    seen = load_seen()
+
+    print(
+        "Previously alerted tokens:",
+        len(seen)
     )
 
     tokens = discover_tokens()
@@ -769,74 +1018,115 @@ def scan():
     )
 
     if not tokens:
+
         print(
-            "No tokens discovered this cycle."
+            "No tokens discovered."
         )
+
+        save_seen(seen)
+
         return
 
     checked = 0
+    alerts = 0
 
     for mint in tokens:
+
         try:
-            process_token(mint)
+
+            if process_token(
+                mint,
+                seen
+            ):
+
+                alerts += 1
+
             checked += 1
 
         except Exception as e:
+
             print(
                 "Token processing error:",
                 mint,
                 e
             )
 
+    save_seen(seen)
+
+    print()
+    print("=" * 60)
+
     print(
-        "Finished cycle.",
+        "SCAN FINISHED"
+    )
+
+    print(
         "Checked:",
-        checked,
-        "| Alerts:",
+        checked
+    )
+
+    print(
+        "New alerts:",
+        alerts
+    )
+
+    print(
+        "Total saved seen tokens:",
         len(seen)
     )
 
+    print("=" * 60)
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
+
     if not check_configuration():
+
         print()
         print(
             "Scanner stopped because configuration "
             "is incomplete."
         )
+
         return
 
     print()
-    print("🚀 Scanner started.")
+    print(
+        "🚀 Automatic scanner started."
+    )
+
+    print(
+        "This run will scan once and finish."
+    )
+
+    print(
+        "GitHub Actions will start the next scan "
+        "automatically."
+    )
+
     print()
 
-    while True:
-        try:
-            scan()
+    try:
 
-        except KeyboardInterrupt:
-            print(
-                "Scanner stopped."
-            )
-            break
+        scan()
 
-        except Exception as e:
-            print(
-                "MAIN SCANNER ERROR:",
-                e
-            )
+    except Exception as e:
 
-        print()
         print(
-            "Waiting",
-            SCAN_INTERVAL,
-            "seconds..."
+            "MAIN SCANNER ERROR:",
+            e
         )
-        print()
 
-        time.sleep(
-            SCAN_INTERVAL
-        )
+        raise
+
+    print()
+    print(
+        "✅ Scan complete."
+    )
 
 
 # ============================================================
